@@ -1,288 +1,279 @@
-# 🚀 Bilibili RAG：把收藏夹变成可对话的知识库
+# BiliRAG
 
-[English](README_EN.md) | 中文
+## 把视频收藏夹变成可追溯的个人知识库
 
-把你在 B 站收藏的访谈/演讲/课程，变成可检索、可追溯来源的**个人知识库**。  
-适合：访谈/演讲/课程、技术视频与学习视频整理、公开课复盘、知识总结、会议/分享回顾、播客内容归档等。
+BiliRAG 是一个面向个人学习资料的 B 站收藏夹知识库。它把收藏夹中的视频同步到本地，获取字幕或语音转写内容，切分为可检索的文本片段，再通过混合检索为问答模型提供相关上下文。
 
-> 亮点：自动拉取内容 → 语音转写 → 向量检索 → 对话问答
+回答不只给出一段生成文本，还会返回命中的视频标题、BV 号和原视频链接，方便回到原始内容核对。
 
----
+![首页](assets/screenshots/home.png)
 
-## ✨ 功能一览
+![对话页](assets/screenshots/chat.png)
 
-- ✅ B 站扫码登录，读取收藏夹
-- ✅ 音频转文字（ASR），自动兜底处理
-- ✅ 支持 B 站多 P 视频逐 P 转写入库
-- ✅ 语义检索（向量检索）
-- ✅ 基于 RAG 的对话问答
-- ✅ 导出视频原始内容或 AI 整理笔记为 Markdown
-- ✅ 本地 SQLite + ChromaDB 存储
+## 项目解决什么问题
 
----
+收藏夹适合保存内容，却不适合回答问题：视频多、标题粒度粗，想找某个观点时往往需要重新打开多个视频并手动定位。
 
-## 🖼️ 演示与截图
+这个项目把流程拆成两部分：
 
-![首页截图](assets/screenshots/home.png)
-![对话界面截图](assets/screenshots/chat.png)
+- **入库**：收藏夹同步 → 内容获取 → 文本切分 → 向量化 → 本地索引
+- **问答**：问题路由 → 向量与关键词召回 → RRF 融合 → MMR 多样性选择 → LLM 生成答案与来源
 
-## B站演示视频：
-[演示视频](https://b23.tv/bGXyhjU)
+## 系统链路
 
-## ⭐ Star History
-[![Star History Chart](https://api.star-history.com/svg?repos=via007/bilibili-rag&type=Date)](https://star-history.com/#via007/bilibili-rag&Date)
+```mermaid
+flowchart LR
+    A[哔哩哔哩收藏夹] --> B[同步收藏夹]
+    B --> C[SQLite 元数据与缓存]
+    C --> D{内容来源}
+    D -->|音频可用| E[ASR 语音转写]
+    D -->|已有字幕| F[字幕文本]
+    D -->|转写失败| G[视频信息或摘要]
+    E --> H[文本切分与元数据]
+    F --> H
+    G --> H
+    H --> I[DashScope Embedding]
+    I --> J[(ChromaDB)]
 
----
+    Q[用户问题] --> R[问题路由]
+    R --> S[向量检索 + MMR]
+    R --> T[SQLite 关键词检索]
+    S --> U[RRF 融合排序]
+    T --> U
+    U --> V[视频级约束与来源去重]
+    V --> W[召回片段上下文]
+    W --> X[LLM]
+    X --> Y[答案 + 视频来源]
+```
 
-## ⚡ 快速开始（3 步）
+## 核心实现
 
-0) 安装 ffmpeg（并确保在 PATH 中）  
-- macOS: `brew install ffmpeg`  
-- Windows: 下载安装包后将 `bin` 目录加入 PATH  
-- Linux: `apt/yum/pacman` 安装 `ffmpeg`  
+### 1. 收藏夹同步
 
-1) 安装依赖  
-```bash
-conda activate bilibili-rag
+用户通过 B 站扫码登录后，后端使用会话中的 Cookie 获取收藏夹和视频列表。同步结果写入 SQLite：
+
+| 表 | 作用 |
+| --- | --- |
+| `user_sessions` | 保存登录会话及 B 站用户标识 |
+| `favorite_folders` | 保存收藏夹、标题、数量和最近同步时间 |
+| `favorite_videos` | 保存收藏夹与视频 BV 号的关联 |
+| `video_cache` | 缓存视频标题、简介、UP 主、转写文本和处理状态 |
+
+同步过程按 BV 号去重，并比较收藏夹当前列表与本地记录，新增视频进入处理队列，已经移除的视频会从对应收藏关系中清理。
+
+### 2. 视频内容获取
+
+`ContentFetcher` 按可用性选择内容来源：
+
+1. 尝试获取视频音频并调用 ASR 转写；
+2. 音频直链不可用时，使用带 Cookie 的本地下载和 `ffmpeg` 转码后再识别；
+3. 多 P 视频逐 P 处理，并合并每一 P 的文本；
+4. 转写不可用时尝试字幕或视频摘要；
+5. 最后保留标题、简介等基本信息，保证视频状态和失败原因可见。
+
+内容来源会记录为 `asr`、`subtitle`、`ai_summary` 或 `basic_info`，因此可以区分“有完整转写”和“只有基本信息”的视频。
+
+### 3. 文本切分与向量索引
+
+入库时，`RAGService.add_video_content()` 使用 `RecursiveCharacterTextSplitter` 处理文本：
+
+- `chunk_size=1000`
+- `chunk_overlap=200`
+- 优先按照段落、换行和中英文句号切分
+
+每个文本块都会带上以下元数据：
+
+```text
+bvid          视频 BV 号
+title         视频标题
+source        内容来源
+doc_type      chunk 或 metadata
+chunk_index   片段序号
+url           原视频地址
+```
+
+除了正文片段，系统还会额外写入一条 `metadata` 文档，包含标题、简介、UP 主、时长和内容提纲，用来提升“哪个视频讲了某主题”这类问题的召回率。向量由 DashScope Embedding 生成，持久化到 ChromaDB。
+
+### 4. 混合检索、RRF 与多样性控制
+
+普通问答默认并发执行两路召回：
+
+- **向量检索**：使用 Chroma 的 MMR，从语义相近的候选片段中兼顾相关性和差异性；
+- **关键词检索**：从问题中去除常见疑问词，提取英文、数字和中文片段，在 SQLite 的标题、简介、正文和 UP 主字段中做匹配。
+
+关键词检索不依赖额外分词器。中文长句会生成 4、3、2 字符的 n-gram；标题命中权重最高，正文命中权重最低。两路结果通过加权 Reciprocal Rank Fusion 合并：
+
+```text
+RRF(d) = 1 / (60 + 向量检索排名) + 0.9 / (60 + 关键词检索排名)
+```
+
+融合后默认保留 8 个结果，并限制同一视频最多占 2 个片段；这样既不会丢掉语义相关内容，也能避免最终上下文被某一个长视频全部占满。
+
+### 5. 送给 LLM 的到底是什么
+
+对于普通知识问答，LLM 接收到的是**召回到的 `Document.page_content` 文本片段**，不是整部视频的全部文字。每个片段前会附带视频标题，多个片段之间用分隔线连接。
+
+系统同时从 `Document.metadata` 中提取 `bvid`、标题和 URL，作为回答后的来源列表返回。因此“回答上下文”和“可追溯来源”是两套信息：前者用于生成答案，后者用于让用户回到视频核对。
+
+列表类问题和总结类问题会走专门的数据库读取路径：列表问题读取收藏夹视频清单；总结问题读取已缓存的视频内容。这两类问题不是简单地把整部视频塞进普通 RAG 上下文，而是由路由逻辑决定读取范围。
+
+## 主要能力
+
+- B 站扫码登录和会话管理
+- 收藏夹列表、视频列表和增量同步
+- 多 P 视频处理、ASR、字幕与基本信息兜底
+- SQLite 缓存 + ChromaDB 向量索引
+- 向量检索、关键词检索、RRF 融合和 MMR
+- 视频级去重、来源链接和检索片段预览
+- 普通问答与流式问答
+- 视频原始内容或 AI 整理结果导出为 Markdown
+- 单视频重新入库、删除视频和取消正在执行的操作
+
+## 技术栈
+
+| 层次 | 技术 |
+| --- | --- |
+| 前端 | Next.js、React、Tailwind CSS |
+| API | FastAPI、Uvicorn |
+| 数据库 | SQLite、SQLAlchemy、aiosqlite |
+| RAG | LangChain、ChromaDB、DashScope Embedding |
+| 模型服务 | OpenAI 兼容聊天接口、DashScope ASR |
+| 媒体处理 | ffmpeg |
+| 部署 | Docker Compose |
+
+## 本地运行
+
+### Docker Compose（推荐）
+
+需要先安装 Docker Desktop，并准备一个可用的 DashScope 或 OpenAI 兼容 API Key。
+
+```powershell
+Copy-Item .env.example .env
+# 编辑 .env，填写 DASHSCOPE_API_KEY 或 OPENAI_API_KEY
+docker compose up -d --build
+docker compose ps
+```
+
+启动后访问：
+
+- 页面：<http://localhost:3000>
+- API 文档：<http://localhost:8000/docs>
+- 健康检查：<http://localhost:8000/health>
+
+查看日志：
+
+```powershell
+docker compose logs --tail 100 -f
+```
+
+停止服务：
+
+```powershell
+docker compose down
+```
+
+`data/` 和 `logs/` 通过 Compose 挂载到宿主机，停止容器不会删除本地数据库和向量库。
+
+### 手动启动
+
+后端需要 Python 3.11、`ffmpeg` 和 Node.js 环境：
+
+```powershell
 pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m uvicorn app.main:app --reload
 ```
 
-2) 配置环境变量  
-```bash
-cp .env.example .env
-# 编辑 .env，填写 DashScope API Key 等配置
+另开一个终端启动前端：
+
+```powershell
+Set-Location frontend
+npm install
+npm run dev
 ```
 
-推荐的百炼 / DashScope OpenAI 兼容配置：
+## 配置重点
+
+`.env` 位于项目根目录，不要提交真实密钥。常用配置如下：
+
 ```env
-DASHSCOPE_API_KEY=你的百炼 API Key
-OPENAI_API_KEY=
+DASHSCOPE_API_KEY=你的百炼APIKey
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL=qwen3-plus
+LLM_MODEL=qwen3-max
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_USE_LLM_ROUTER=false
-```
 
-可选的召回参数：
-```env
 RETRIEVAL_CANDIDATE_K=24
 RETRIEVAL_TOP_K=8
 RETRIEVAL_MMR_FETCH_K=32
 RETRIEVAL_MMR_LAMBDA=0.55
 ```
 
-注意：
-- `.env` 必须放在项目根目录，不是 `frontend/` 目录
-- `OPENAI_BASE_URL` 用于 LLM 对话，推荐使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- `DASHSCOPE_API_KEY` 用于 DashScope ASR 和 Embedding；Embedding 通过 DashScope SDK 调用，不使用 `OPENAI_BASE_URL`
-- `DASHSCOPE_BASE_URL` 只用于 ASR，不要和 `OPENAI_BASE_URL` 混用
-- `CHAT_USE_LLM_ROUTER=false` 会跳过每次回答前的额外路由模型调用，首字更快；如需更智能的自动路由可改为 `true`
-- 召回参数通常保持默认即可；如果库很大且想要更高召回，可适当增大 `RETRIEVAL_CANDIDATE_K`
-- 修改 `.env` 后需要重启后端服务
-- 不要把真实 API Key 提交到 GitHub
+修改模型或密钥后需要重新创建后端容器：
 
-3) 启动服务  
-```bash
-python -m uvicorn app.main:app --reload
-```
-后端文档：`http://localhost:8000/docs`
-
-前端：
-```bash
-cd frontend
-npm install
-npm run dev
-```
-前端页面：`http://localhost:3000`
-
-### Docker 本地一键部署
-
-适合只想快速跑起来的本地环境。Docker 会同时启动后端和前端，数据会持久化到本地 `data/`，日志会写到 `logs/`。
-
-```bash
-cp .env.example .env
-# 编辑 .env，至少填写 DASHSCOPE_API_KEY 或 OPENAI_API_KEY
-docker compose up --build
+```powershell
+docker compose up -d --force-recreate backend
 ```
 
-启动后访问：
-- 前端页面：`http://localhost:3000`
-- 后端文档：`http://localhost:8000/docs`
+聊天接口使用 `OPENAI_BASE_URL` 指向的兼容接口；Embedding 和 ASR 使用 DashScope 自己的接口配置。两者不要混用。
 
-停止服务：
-```bash
-docker compose down
+## API 入口
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/auth/qrcode` | 获取登录二维码 |
+| `GET` | `/favorites/list` | 获取收藏夹列表 |
+| `GET` | `/favorites/{media_id}/videos` | 获取收藏夹视频 |
+| `POST` | `/knowledge/folders/sync` | 同步收藏夹 |
+| `POST` | `/knowledge/build` | 后台构建知识库 |
+| `GET` | `/knowledge/build/status/{task_id}` | 查询构建进度 |
+| `POST` | `/chat/ask` | 非流式问答 |
+| `POST` | `/chat/ask/stream` | 流式问答 |
+| `POST` | `/chat/search` | 直接检索片段 |
+| `GET` | `/knowledge/stats` | 查看向量库统计 |
+
+完整参数和响应格式以 `/docs` 中的 OpenAPI 文档为准。
+
+## 目录结构
+
+```text
+.
+├── app/
+│   ├── routers/          # 登录、收藏夹、知识库、问答接口
+│   ├── services/         # B 站访问、内容获取、ASR、RAG、检索
+│   ├── models.py         # SQLite 模型与 API 数据模型
+│   ├── database.py       # 异步数据库初始化与会话
+│   └── main.py           # FastAPI 应用入口
+├── frontend/             # Next.js 前端
+├── data/                 # SQLite 与 ChromaDB 持久化目录
+├── logs/                 # 后端日志
+├── test/                 # 检索、数据库和接口测试
+├── docker-compose.yml
+├── Dockerfile
+└── requirements.txt
 ```
 
-如果修改了 `.env` 中的模型或 API Key，重新启动容器：
-```bash
-docker compose up --build
+## 测试与排查
+
+```powershell
+pytest -q
 ```
 
----
+如果页面能打开但没有内容，先检查：
 
-## 🧠 工作流程
+1. `/health` 是否返回 `{"status":"healthy"}`；
+2. 是否完成 B 站扫码登录；
+3. 是否选择收藏夹并完成入库；
+4. 后端日志中是否存在 ASR、API Key 或向量写入错误；
+5. 本机或容器内是否安装了 `ffmpeg`。
 
-1. 选择收藏夹  
-2. 拉取视频 → 音频转写（ASR）  
-3. 生成向量 → 构建知识库  
-4. 对话/检索问答  
+## 使用边界
 
----
+- 本项目只保存用户有权访问的内容索引和本地缓存，不替代 B 站播放器或内容授权。
+- B 站接口、音频地址和字幕权限可能变化，某些视频无法转写时会进入兜底状态。
+- ASR、Embedding 和 LLM 调用可能产生费用，建议先用短视频验证配置。
+- 当前会话 Cookie 写入本地 SQLite，部署到多人环境前应补充加密存储、权限控制和更严格的 CORS 配置。
 
-## 🤖 OpenClaw Skill（本地接入）
+## License
 
-本仓库已提供一个可直接使用的 Skill：`skills/bilibili-rag-local/SKILL.md`。  
-作用：把本地运行的 `bilibili-rag` 服务接入 OpenClaw，让 OpenClaw 直接调用你的收藏夹知识库进行检索和问答。
-
-### 前置条件
-
-1. 先按上面的步骤完成本项目本地部署。  
-2. 确认后端接口可访问：`http://127.0.0.1:8000/docs`。  
-3. 确认 OpenClaw 已安装并可加载本地 Skills。  
-
-### 接入方式
-
-1. 将本仓库中的 `skills/bilibili-rag-local` 放到 OpenClaw 的 Skills 目录（例如 `~/.openclaw/skills/`）。  
-2. 重启或刷新 OpenClaw Skills。  
-3. 在 OpenClaw 中调用该 Skill，让它通过本地 API 执行：  
-   - `POST /chat/ask`（问答）  
-   - `POST /chat/search`（检索片段）  
-   - `GET /knowledge/folders/status`（入库状态）  
-
-### 使用建议
-
-1. 先同步/入库收藏夹，再进行问答。  
-2. 问题越具体，召回效果越好。  
-3. 若出现“无命中”，优先检查是否完成入库或是否选错收藏夹。  
-
----
-
-## 🧩 基于 Skill 的扩展示例
-
-你可以在 `skills/` 目录继续开发更多 Skill，把收藏夹真正变成可持续运营的知识系统。  
-例如结合 OpenClaw 的定时能力（Cron）做自动化：
-
-1. 每日/每周统计收藏夹入库状态（新增、未入库、失败项）。  
-2. 定时生成“新增收藏学习摘要”（按主题聚合要点）。  
-3. 定时输出“待补全内容清单”（ASR 失败、内容过短、召回弱视频）。  
-4. 将统计结果自动推送到你常用的消息渠道，形成固定复盘节奏。  
-
----
-
-## 🧪 测试与诊断脚本
-
-> 注意：`test/` 目录下的脚本需要 **移动到项目根目录** 再运行（依赖相对路径与配置）。
-
-- `debug_asr_single.py`：测试单个视频是否能正确获取音频  
-- `diagnose_rag.py`：测试向量检索召回是否准确  
-- `sync_cache_vectors.py`：同步数据库缓存数据到向量库  
-
----
-
-## 🎧 ASR 说明（音频不可达兜底）
-
-部分 B 站音频 URL 可能返回 403（直链不可拉取），系统会自动执行兜底流程：
-
-1. 本地下载音频（带 Cookie）
-2. ffmpeg 转码为 16k 单声道
-3. 上传到 DashScope 后再识别
-
-多 P 视频会按分 P 逐段转写并合并入库，耗时和 ASR 费用会按实际分 P 总时长增加。
-
-> 请确保本机已安装 `ffmpeg` 并加入 PATH。
-
----
-
-## 💰 费用说明（DashScope）
-
-模型相关费用包括：
-- LLM 对话（按 Token）
-- Embedding（按 Token）
-- ASR 音频转写（按时长）
-
-建议：
-- 部署/测试阶段先用 **短视频（约 10 分钟）**验证流程与费用  
-- 正式使用按需启用，注意费用；大多数模型有免费额度，通常足够日常使用  
-
-### 模型配置常见错误
-
-**Q：报错 `The api_key client option must be set` 是什么原因？**  
-A：后端没有读到有效 API Key。请检查 `.env` 是否在项目根目录，并确认至少配置了 `DASHSCOPE_API_KEY` 或 `OPENAI_API_KEY`。
-
-**Q：百炼 / DashScope 的 `OPENAI_BASE_URL` 应该填什么？**  
-A：推荐填 `https://dashscope.aliyuncs.com/compatible-mode/v1`。不要填 `https://coding.dashscope.aliyuncs.com/v1`，也不要把 ASR 的 `DASHSCOPE_BASE_URL` 填到这里。
-
-**Q：报错 `DashScope Embedding 初始化失败` 是什么原因？**
-
-A：后端缺少 Embedding 所需依赖。请运行 `pip install -r requirements.txt` 后重启后端。Embedding 使用 DashScope SDK，不会自动切换到 `OPENAI_BASE_URL`。
-
-**Q：报错 `AllocationQuota.FreeTierOnly` 是什么原因？**  
-A：这是上游模型服务返回的配额错误，通常表示免费额度已耗尽，或控制台开启了“仅使用免费额度”。这不是本项目代码错误，需要在模型服务控制台调整额度/付费设置，或切换可用模型。
-
-**Q：改了 `.env` 但模型没有变化？**  
-A：配置在后端启动时读取。修改 `.env` 后请重启 `uvicorn` 后端服务。
-
----
-
-## 🧩 技术栈
-
-- 后端：FastAPI  
-- LLM：LangChain + DashScope  
-- 向量库：ChromaDB  
-- 前端：Next.js + Tailwind  
-- 数据库：SQLite  
-
----
-
-## 📂 目录结构（简版）
-
-```
-bilibili-rag/
-├── app/                # 后端逻辑
-├── frontend/           # 前端界面
-├── data/               # 数据库与向量库
-├── skills/             # OpenClaw Skills（含 bilibili-rag-local）
-├── test/               # 测试脚本（需移动到根目录再运行）
-└── README.md
-```
-
----
-
-## ✅ 常见问题
-
-**Q：为什么有些音频 URL 可达、有些不可达？**  
-A：B 站音频直链存在鉴权/过期/区域限制，只有公网可直接拉取的 URL 才可达。
-
----
-
-> 免责声明：本项目采用 Apache-2.0 许可证。使用者仍需自行遵守相关平台协议与法律法规；本软件不授予 B 站视频、音频、字幕或其他第三方内容的任何权利。
-
----
-
-## 📜 License
-
-[Apache-2.0](LICENSE)
-
----
-
-## 🧩 TodoList
-
-- 对话存储、会话管理、检索历史对话记录
-- 适配更多 LLM 与向量模型
-
----
-
-## 支持项目
-
-如果这个项目对你有帮助，欢迎自愿支持后续维护：
-
-<img src="docs/alipay-support.jpg" alt="支付宝支持项目" width="280">
-
-支持完全自愿，不影响项目免费使用。
-
-## 🔎 Fork 版本：混合检索实现说明
-
-本版本补充说明检索链路：向量召回使用 ChromaDB 与 MMR；关键词召回使用 SQLite `LIKE` 匹配标题、简介、转写正文和 UP 主名称，并按字段加权；两路结果使用 RRF 融合排序，融合后限制同一视频最多保留 2 个片段，减少重复结果。
-
-每个片段保留 `bvid`、标题、`url` 和 `chunk_index` 等来源 metadata，回答可以追溯到对应视频。精确跳转到视频时间点需要额外保存 ASR 起止时间戳。
+本项目使用 [Apache-2.0](LICENSE) 许可证。第三方视频、音频、字幕及其衍生内容的权利仍归原权利人所有。
